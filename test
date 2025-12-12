@@ -1,0 +1,39 @@
+local URL = "https://raw.githubusercontent.com/thinh2007dev/script/refs/heads/main/auto%20joiner"
+
+-- Auto-detect HTTP function
+local httpRequest = (syn and syn.request) or (http and http.request) or http_request or (fluxus and fluxus.request) or request
+
+if not httpRequest then
+    warn("❌ Executor không hỗ trợ HTTP requests!")
+    return
+end
+
+print("🚀 Detected HTTP function: " .. tostring(httpRequest))
+print("Spamming 100 requests...")
+
+local start = tick()
+local completed = 0
+
+for i = 1, 100 do
+    spawn(function()
+        local success = pcall(function()
+            httpRequest({
+                Url = URL,
+                Method = "GET"
+            })
+        end)
+        
+        completed = completed + 1
+        if success then
+            print("✓ " .. completed .. "/100")
+        else
+            print("✗ " .. completed .. "/100")
+        end
+    end)
+end
+
+-- Đợi hoàn thành
+repeat task.wait(0.1) until completed >= 100
+
+print("━━━━━━━━━━━━━━━━━━━━━━━━━━")
+print(string.format("✅ Done in %.2fs (%.1f req/s)", tick() - start, 100/(tick()-start)))
