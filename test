@@ -1,39 +1,2068 @@
-local URL = "https://raw.githubusercontent.com/thinh2007dev/script/refs/heads/main/auto%20joiner"
+-- Dual Speed + Auto Steal Script (ProximityPrompt Detection)
+-- By: binbaby9997
+-- Game: Pet Simulator 99 (or similar)
 
--- Auto-detect HTTP function
-local httpRequest = (syn and syn.request) or (http and http.request) or http_request or (fluxus and fluxus.request) or request
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Stats = game:GetService("Stats")
+local player = Players.LocalPlayer
 
-if not httpRequest then
-    warn("❌ Executor không hỗ trợ HTTP requests!")
-    return
+-- ============================================
+-- SETTINGS - Có thể chỉnh ở đây
+-- ============================================
+local SPEED_NORMAL = 57         -- Tốc độ khi KHÔNG stealing
+local SPEED_STEALING = 29       -- Tốc độ khi ĐANG stealing
+local HITBOX_SIZE = 12          -- Kích thước hitbox (studs)
+local JUMP_POWER = 70           -- Jump velocity (default 70)
+local GRAVITY_POWER = 50        -- Fall speed % (50 = 50% fall speed, lower = slower)
+
+-- ============================================
+-- CONFIG SYSTEM
+-- ============================================
+local CONFIG_FILE = "meowpvp.json"
+local HttpService = game:GetService("HttpService")
+
+local defaultConfig = {
+    speedNormal = 57,
+    speedStealing = 29,
+    hitboxSize = 12,
+    autoBatKeybind = "Q",
+    speedEnabled = false,
+    autoBatEnabled = false,
+    hitboxEnabled = false,
+    antiRagdollEnabled = false,
+    autoStealNearestEnabled = false,
+    stealRadius = 60,
+    jumpBoostEnabled = false,
+    jumpPower = 70,
+    gravityPower = 50
+}
+
+local config = table.clone(defaultConfig)
+
+local function saveConfig()
+    if not writefile then 
+        warn(" Executor doesn't support writefile")
+        return 
+    end
+    
+    local success, err = pcall(function()
+        writefile(CONFIG_FILE, HttpService:JSONEncode(config))
+    end)
+    if success then
+        print(" Config saved:", CONFIG_FILE)
+    else
+        warn(" Failed to save config:", err)
+    end
 end
 
-print("🚀 Detected HTTP function: " .. tostring(httpRequest))
-print("Spamming 100 requests...")
+local function loadConfig()
+    if not readfile or not isfile then 
+        warn(" Executor doesn't support readfile/isfile")
+        return 
+    end
+    
+    if isfile(CONFIG_FILE) then
+        local success, data = pcall(function()
+            return HttpService:JSONDecode(readfile(CONFIG_FILE))
+        end)
+        if success and data then
+            for key, value in pairs(data) do
+                config[key] = value
+            end
+            -- Apply loaded values
+            SPEED_NORMAL = config.speedNormal
+            SPEED_STEALING = config.speedStealing
+            HITBOX_SIZE = config.hitboxSize
+            STEAL_RADIUS = config.stealRadius or 60
+            JUMP_POWER = config.jumpPower or 70
+            GRAVITY_POWER = config.gravityPower or 50
+            GRAVITY_POWER = config.gravityPower or 50
+            print(" Config loaded from:", CONFIG_FILE)
+        else
+            warn(" Failed to load config")
+        end
+    else
+        print(" No config file found, using defaults")
+    end
+end
 
-local start = tick()
-local completed = 0
+-- ============================================
+-- INTERNAL VARIABLES - Không cần chỉnh
+-- ============================================
+local enabled = false
+local autoBatEnabled = false
+local hitboxEnabled = false
+local antiRagdollEnabled = false
+local autoStealNearestEnabled = false
+local jumpBoostEnabled = false
 
-for i = 1, 100 do
-    spawn(function()
-        local success = pcall(function()
-            httpRequest({
-                Url = URL,
-                Method = "GET"
-            })
+-- Anti Ragdoll state
+local RAGDOLL_ENABLED = false
+local RAGDOLL_CONNECTIONS = {}
+local cachedCharData = {}
+
+-- Jump boost state
+local hrp = nil
+local jumpButtonGui = nil
+local speedConn = nil
+local autoBatConn = nil
+local hitboxConn = nil
+local currentSpeed = SPEED_NORMAL
+
+-- ============================================
+-- HELPER FUNCTIONS
+-- ============================================
+
+-- Check nếu đang stealing (từ Player attribute)
+local function isStealing()
+    local stealing = player:GetAttribute("Stealing")
+    return stealing == true
+end
+
+-- Get tên pet đang stealing
+local function getStealingPet()
+    return player:GetAttribute("StealingIndex")
+end
+
+-- Apply speed boost
+local function updateSpeed()
+    local char = player.Character
+    if not char then return end
+    
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum then return end
+    
+    -- Update current speed based on stealing state
+    local stealing = isStealing()
+    currentSpeed = stealing and SPEED_STEALING or SPEED_NORMAL
+    
+    local moveDir = hum.MoveDirection
+    if moveDir.Magnitude > 0.1 then
+        local dir = moveDir.Unit
+        hrp.AssemblyLinearVelocity = Vector3.new(
+            dir.X * currentSpeed,
+            hrp.AssemblyLinearVelocity.Y,
+            dir.Z * currentSpeed
+        )
+    end
+end
+
+-- ============================================
+-- AUTO BAT FUNCTION
+-- ============================================
+
+local function autoBatLoop()
+    print(" Auto Bat Loop Started")
+    while autoBatEnabled do
+        RunService.RenderStepped:Wait()
+        
+        local char = player.Character
+        if not char then continue end
+        
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        local backpack = player:FindFirstChild("Backpack")
+        
+        if not hum or not backpack then continue end
+        
+        -- Tìm Bat trong Backpack hoặc Character
+        local bat = backpack:FindFirstChild("Bat") or char:FindFirstChild("Bat")
+        
+        if bat then
+            -- Equip và activate bat
+            if bat.Parent == backpack then
+                hum:EquipTool(bat)
+            end
+            bat:Activate()
+        end
+    end
+    print("🛑 Auto Bat Loop Stopped")
+end
+
+-- ============================================
+-- HITBOX EXPANDER FUNCTIONS
+-- ============================================
+-- ============================================
+
+local function updateHitboxes()
+    for _, plr in pairs(Players:GetPlayers()) do
+        if plr ~= player and plr.Character then
+            local hrp = plr.Character:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                hrp.Size = Vector3.new(HITBOX_SIZE, HITBOX_SIZE, HITBOX_SIZE)
+                hrp.Transparency = 0.7
+                hrp.Color = Color3.fromRGB(255, 100, 100)
+                hrp.Material = Enum.Material.Neon
+                hrp.CanCollide = false
+            end
+        end
+    end
+end
+
+local function resetHitboxes()
+    for _, plr in pairs(Players:GetPlayers()) do
+        if plr ~= player and plr.Character then
+            local hrp = plr.Character:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                hrp.Size = Vector3.new(2, 2, 1)
+                hrp.Transparency = 1
+                hrp.Material = Enum.Material.Plastic
+                hrp.CanCollide = false
+            end
+        end
+    end
+end
+
+-- ============================================
+-- ANTI RAGDOLL SYSTEM
+-- ============================================
+
+local function clearRagdollConnections()
+    for _, conn in ipairs(RAGDOLL_CONNECTIONS) do
+        pcall(function() conn:Disconnect() end)
+    end
+    RAGDOLL_CONNECTIONS = {}
+end
+
+local function cacheCharacterData()
+    local char = player.Character
+    if not char then return false end
+    
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not hum or not root then return false end
+    
+    cachedCharData = {
+        character = char,
+        humanoid = hum,
+        root = root,
+        originalWalkSpeed = hum.WalkSpeed,
+        originalJumpPower = hum.JumpPower,
+    }
+    
+    return true
+end
+
+local function isRagdolled()
+    if not cachedCharData.humanoid then return false end
+    
+    local hum = cachedCharData.humanoid
+    local state = hum:GetState()
+    
+    local ragdollStates = {
+        [Enum.HumanoidStateType.Physics]     = true,
+        [Enum.HumanoidStateType.Ragdoll]     = true,
+        [Enum.HumanoidStateType.FallingDown] = true
+    }
+    
+    if ragdollStates[state] then
+        return true
+    end
+    
+    local endTime = player:GetAttribute("RagdollEndTime")
+    if endTime then
+        local Workspace = game:GetService("Workspace")
+        local now = Workspace:GetServerTimeNow()
+        if (endTime - now) > 0 then
+            return true
+        end
+    end
+    
+    return false
+end
+
+local function removeRagdollConstraints()
+    local removed = false
+    
+    for _, descendant in ipairs(cachedCharData.character:GetDescendants()) do
+        if descendant:IsA("BallSocketConstraint") or 
+           (descendant:IsA("Attachment") and descendant.Name:find("RagdollAttachment")) then
+            pcall(function()
+                descendant:Destroy()
+                removed = true
+            end)
+        end
+    end
+    
+    return removed
+end
+
+local function forceExitRagdoll()
+    if not cachedCharData.humanoid or not cachedCharData.root then return end
+    
+    local hum = cachedCharData.humanoid
+    local root = cachedCharData.root
+    
+    pcall(function()
+        local Workspace = game:GetService("Workspace")
+        local now = Workspace:GetServerTimeNow()
+        player:SetAttribute("RagdollEndTime", now)
+    end)
+    
+    if hum.Health > 0 then
+        hum:ChangeState(Enum.HumanoidStateType.Running)
+    end
+    
+    root.Anchored = false
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+end
+
+local function v1HeartbeatLoop()
+    while RAGDOLL_ENABLED and cachedCharData.humanoid do
+        task.wait()
+        
+        if isRagdolled() then
+            removeRagdollConstraints()
+            forceExitRagdoll()
+        end
+    end
+end
+
+local function setupCameraBinding()
+    if not cachedCharData.humanoid then return end
+    
+    local conn = RunService.RenderStepped:Connect(function()
+        if not RAGDOLL_ENABLED then return end
+        
+        local cam = game:GetService("Workspace").CurrentCamera
+        if cam and cachedCharData.humanoid and cam.CameraSubject ~= cachedCharData.humanoid then
+            cam.CameraSubject = cachedCharData.humanoid
+        end
+    end)
+    
+    table.insert(RAGDOLL_CONNECTIONS, conn)
+end
+
+local function onCharacterAddedForRagdoll(char)
+    task.wait(0.5)
+    
+    if not RAGDOLL_ENABLED then return end
+    
+    if cacheCharacterData() then
+        setupCameraBinding()
+        task.spawn(v1HeartbeatLoop)
+    end
+end
+
+local function enableAntiRagdoll()
+    RAGDOLL_ENABLED = true
+    antiRagdollEnabled = true
+    
+    if cacheCharacterData() then
+        setupCameraBinding()
+        task.spawn(v1HeartbeatLoop)
+    end
+    
+    local charConn = player.CharacterAdded:Connect(onCharacterAddedForRagdoll)
+    table.insert(RAGDOLL_CONNECTIONS, charConn)
+end
+
+local function disableAntiRagdoll()
+    RAGDOLL_ENABLED = false
+    antiRagdollEnabled = false
+    clearRagdollConnections()
+    cachedCharData = {}
+end
+
+-- ============================================
+-- AUTO STEAL NEAREST SYSTEM (From Petfin.txt)
+-- ============================================
+
+local stealNearestConnection = nil
+local STEAL_RADIUS = 60
+local STEAL_MIN_PERCENT = 0
+
+-- State caches
+local STATE = {
+    allAnimalsCache = {},
+    PromptMemoryCache = {},
+    InternalStealCache = {}
+}
+
+-- Check if plot belongs to player
+local function isMyBaseAnimal(plotName)
+    if not plotName then return false end
+    local plots = game:GetService("Workspace"):FindFirstChild('Plots')
+    if not plots then return false end
+    local plotObj = plots:FindFirstChild(plotName)
+    if not plotObj then return false end
+    
+    -- Method 1: Check Synchronizer Owner (if exists)
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+    local Synchronizer = ReplicatedStorage:FindFirstChild('Synchronizer')
+    if Synchronizer then
+        local success, channel = pcall(function()
+            return Synchronizer:Get(plotObj.Name)
         end)
         
-        completed = completed + 1
-        if success then
-            print("✓ " .. completed .. "/100")
-        else
-            print("✗ " .. completed .. "/100")
+        if success and channel then
+            local ownerSuccess, owner = pcall(function()
+                return channel:Get('Owner')
+            end)
+            
+            if ownerSuccess and owner then
+                if typeof(owner) == 'Instance' and owner:IsA('Player') then
+                    return owner.UserId == player.UserId
+                elseif typeof(owner) == 'table' and owner.UserId then
+                    return owner.UserId == player.UserId
+                end
+            end
+        end
+    end
+    
+    -- Method 2: Check PlotSign YourBase
+    local sign = plotObj:FindFirstChild('PlotSign')
+    if sign then
+        local yourBase = sign:FindFirstChild('YourBase')
+        if yourBase and yourBase:IsA('BillboardGui') then
+            return yourBase.Enabled == true
+        end
+    end
+    
+    -- Method 3: Fallback - check if plotName matches player name
+    return plotName == player.Name
+end
+
+-- Get all podiums with prompts
+local function getAllPodiums()
+    local podiumsData = {}
+    local plots = game:GetService("Workspace"):FindFirstChild('Plots')
+    if not plots then return podiumsData end
+    
+    for _, plot in pairs(plots:GetChildren()) do
+        local animalPodiums = plot:FindFirstChild('AnimalPodiums')
+        if animalPodiums then
+            for _, podium in pairs(animalPodiums:GetChildren()) do
+                local position = nil
+                if podium:IsA('Model') then
+                    position = podium:GetPivot().Position
+                elseif podium:IsA('BasePart') then
+                    position = podium.Position
+                end
+                
+                if position then
+                    local prompt = nil
+                    local base = podium:FindFirstChild('Base')
+                    if base then
+                        local spawn = base:FindFirstChild('Spawn')
+                        if spawn then
+                            local promptAttachment = spawn:FindFirstChild('PromptAttachment')
+                            if promptAttachment then
+                                prompt = promptAttachment:FindFirstChild('ProximityPrompt')
+                            end
+                        end
+                    end
+                    
+                    if not prompt then
+                        for _, desc in pairs(podium:GetDescendants()) do
+                            if desc:IsA('ProximityPrompt') then
+                                prompt = desc
+                                break
+                            end
+                        end
+                    end
+                    
+                    table.insert(podiumsData, {
+                        podium = podium,
+                        position = position,
+                        plotName = plot.Name,
+                        slotNumber = podium.Name,
+                        plot = plot,
+                        prompt = prompt,
+                    })
+                end
+            end
+        end
+    end
+    
+    return podiumsData
+end
+
+-- Get all animals from Debris
+local function getAllAnimals()
+    local animals = {}
+    local debris = game:GetService("Workspace"):FindFirstChild('Debris')
+    if not debris then return animals end
+    
+    local allPodiums = getAllPodiums()
+    
+    for _, template in pairs(debris:GetChildren()) do
+        local animalOverhead = template:FindFirstChild('AnimalOverhead')
+        
+        if animalOverhead and (animalOverhead:IsA('SurfaceGui') or animalOverhead:IsA('BillboardGui')) then
+            local petData = {displayName=nil, generation=nil, mutation=nil, price=nil, rarity=nil}
+            
+            for _, desc in pairs(animalOverhead:GetDescendants()) do
+                if desc:IsA('TextLabel') then
+                    local name, text = desc.Name, desc.Text
+                    if name == "DisplayName" then petData.displayName = text
+                    elseif name == "Generation" then petData.generation = text
+                    elseif name == "Mutation" then petData.mutation = text
+                    elseif name == "Price" then petData.price = text
+                    elseif name == "Rarity" then petData.rarity = text end
+                end
+            end
+            
+            if petData.displayName and petData.displayName ~= "" then
+                if petData.displayName == "STOLEN" or petData.displayName == "Stolen" then continue end
+                
+                local templatePos = nil
+                if animalOverhead.Adornee then
+                    if animalOverhead.Adornee:IsA('Model') then
+                        templatePos = animalOverhead.Adornee:GetPivot().Position
+                    elseif animalOverhead.Adornee:IsA('BasePart') then
+                        templatePos = animalOverhead.Adornee.Position
+                    end
+                end
+                if not templatePos and template:IsA('Model') then
+                    templatePos = template:GetPivot().Position
+                elseif not templatePos and template:IsA('BasePart') then
+                    templatePos = template.Position
+                end
+                
+                local closestPodium, minDistance = nil, math.huge
+                
+                if templatePos then
+                    local templateFloor = templatePos.Y > 22 and 3 or (templatePos.Y > 7 and 2 or 1)
+                    
+                    for _, podiumData in ipairs(allPodiums) do
+                        local podiumFloor = podiumData.position.Y > 22 and 3 or (podiumData.position.Y > 7 and 2 or 1)
+                        
+                        if templateFloor == podiumFloor then
+                            local distance = (templatePos - podiumData.position).Magnitude
+                            if distance < minDistance and distance < 15 then
+                                minDistance, closestPodium = distance, podiumData
+                            end
+                        end
+                    end
+                end
+                
+                if closestPodium and closestPodium.plot and not isMyBaseAnimal(closestPodium.plotName) then
+                    local numStr, suffix = (petData.generation or ""):match("%$([%d%.]+)([KMBT]?)/s")
+                    local genValue = 0
+                    if numStr then
+                        local num = tonumber(numStr) or 0
+                        genValue = suffix == "T" and num * 1e12 or 
+                                   suffix == "B" and num * 1e9 or 
+                                   suffix == "M" and num * 1e6 or 
+                                   suffix == "K" and num * 1e3 or num
+                    end
+                    
+                    table.insert(animals, {
+                        plot = closestPodium.plotName,
+                        slot = closestPodium.slotNumber,
+                        genValue = genValue,
+                        name = petData.displayName,
+                        mutation = petData.mutation or "",
+                        rarity = petData.rarity or "",
+                        position = templatePos,
+                        prompt = closestPodium.prompt,
+                        uid = closestPodium.plotName .. "_" .. closestPodium.slotNumber,
+                    })
+                end
+            end
+        end
+    end
+    
+    table.sort(animals, function(a, b) return (a.genValue or 0) > (b.genValue or 0) end)
+    STATE.allAnimalsCache = animals
+    return animals
+end
+
+-- Get animal position
+local function getAnimalPosition(plot, slot)
+    local plots = game:GetService("Workspace"):FindFirstChild('Plots')
+    if not plots then return nil end
+    local plotObj = plots:FindFirstChild(plot)
+    if not plotObj then return nil end
+    
+    local podiums = plotObj:FindFirstChild('AnimalPodiums')
+    if not podiums then return nil end
+    local podium = podiums:FindFirstChild(slot)
+    if not podium then return nil end
+    
+    if podium:IsA("Model") then
+        return podium:GetPivot().Position
+    elseif podium:IsA("BasePart") then
+        return podium.Position
+    end
+    
+    return nil
+end
+
+-- Find proximity prompt for animal
+local function findProximityPromptForAnimal(plot, slot)
+    local uid = plot .. '_' .. slot
+    local cachedPrompt = STATE.PromptMemoryCache[uid]
+    if cachedPrompt and cachedPrompt.Parent then
+        return cachedPrompt
+    end
+    
+    for _, animal in ipairs(STATE.allAnimalsCache or {}) do
+        if animal.plot == plot and animal.slot == slot then
+            if animal.prompt then
+                STATE.PromptMemoryCache[uid] = animal.prompt
+            end
+            return animal.prompt
+        end
+    end
+    
+    local plots = game:GetService("Workspace"):FindFirstChild('Plots')
+    if not plots then return nil end
+    local plotObj = plots:FindFirstChild(plot)
+    if not plotObj then return nil end
+    
+    local podiums = plotObj:FindFirstChild('AnimalPodiums')
+    if not podiums then return nil end
+    local podium = podiums:FindFirstChild(slot)
+    if not podium then return nil end
+    
+    for _, descendant in ipairs(podium:GetDescendants()) do
+        if descendant:IsA('ProximityPrompt') then
+            STATE.PromptMemoryCache[uid] = descendant
+            return descendant
+        end
+    end
+    
+    return nil
+end
+
+-- Build steal callbacks
+local getconnections = getconnections or function() return {} end
+
+local function buildStealCallbacks(prompt)
+    if STATE.InternalStealCache[prompt] then return end
+    
+    -- Pre-fire prompt to ensure connections are created
+    pcall(function()
+        prompt:InputHoldBegin()
+        task.wait(0.01)
+        prompt:InputHoldEnd()
+    end)
+    task.wait(0.05) -- Wait for connections to be created
+    
+    local data = {
+        holdCallbacks = {},
+        triggerCallbacks = {},
+        ready = true,
+    }
+    
+    local ok1, conns1 = pcall(getconnections, prompt.PromptButtonHoldBegan)
+    if ok1 and type(conns1) == "table" then
+        for _, conn in ipairs(conns1) do
+            if type(conn.Function) == "function" then
+                table.insert(data.holdCallbacks, conn.Function)
+            end
+        end
+    end
+    
+    local ok2, conns2 = pcall(getconnections, prompt.Triggered)
+    if ok2 and type(conns2) == "table" then
+        for _, conn in ipairs(conns2) do
+            if type(conn.Function) == "function" then
+                table.insert(data.triggerCallbacks, conn.Function)
+            end
+        end
+    end
+    
+    print('[Build Callbacks]', #data.holdCallbacks, 'hold,', #data.triggerCallbacks, 'trigger')
+    
+    if (#data.holdCallbacks > 0) or (#data.triggerCallbacks > 0) then
+        STATE.InternalStealCache[prompt] = data
+    end
+end
+
+local function runCallbackList(list)
+    for _, fn in ipairs(list) do
+        task.spawn(fn)
+    end
+end
+
+-- Execute internal steal
+local StealingProgress = 0
+
+local fireproximityprompt = fireproximityprompt or function(prompt)
+    if not prompt or not prompt:IsA("ProximityPrompt") then return end
+    pcall(function()
+        prompt:InputHoldBegin()
+        task.wait(prompt.HoldDuration or 0.1)
+        prompt:InputHoldEnd()
+    end)
+end
+
+local function executeInternalStealAsync(prompt)
+    local data = STATE.InternalStealCache[prompt]
+    if not data or not data.ready then return false end
+    
+    data.ready = false
+    
+    task.spawn(function()
+        StealingProgress = 0
+        local startTime = tick()
+        local duration = 1.3
+        
+        task.spawn(function()
+            while (tick() - startTime) < duration do
+                StealingProgress = math.min(100, ((tick() - startTime) / duration) * 100)
+                
+                -- Update % display
+                pcall(function()
+                    local gui = game:GetService("CoreGui"):FindFirstChild("DualSpeedGUI") or player.PlayerGui:FindFirstChild("DualSpeedGUI")
+                    if gui then
+                        local statusFrame = gui:FindFirstChild("Frame")
+                        if statusFrame then
+                            local percentDisplay = statusFrame:FindFirstChild("PercentDisplay")
+                            if percentDisplay then
+                                percentDisplay.Text = tostring(math.floor(StealingProgress))
+                                
+                                if StealingProgress >= 100 then
+                                    percentDisplay.TextColor3 = Color3.fromRGB(100, 255, 100)
+                                elseif StealingProgress > 0 then
+                                    percentDisplay.TextColor3 = Color3.fromRGB(255, 200, 100)
+                                else
+                                    percentDisplay.TextColor3 = Color3.fromRGB(255, 100, 100)
+                                end
+                            end
+                        end
+                    end
+                end)
+                
+                task.wait(0.05)
+            end
+            StealingProgress = 100
+        end)
+        
+        if #data.holdCallbacks > 0 then
+            runCallbackList(data.holdCallbacks)
+        end
+        
+        task.wait(duration)
+        
+        if #data.triggerCallbacks > 0 then
+            runCallbackList(data.triggerCallbacks)
+        end
+        
+        StealingProgress = 100
+        task.wait()
+        StealingProgress = 0
+        
+        data.ready = true
+    end)
+    
+    return true
+end
+
+-- Get nearest animal
+local function getNearestAnimal()
+    local char = player.Character
+    if not char then return nil end
+    local hrp = char:FindFirstChild('HumanoidRootPart')
+    if not hrp then return nil end
+    
+    local nearest = nil
+    local minDist = math.huge
+    
+    local animals = getAllAnimals()
+    for _, animalData in ipairs(animals) do
+        local pos = getAnimalPosition(animalData.plot, animalData.slot)
+        if pos then
+            local dist = (hrp.Position - pos).Magnitude
+            
+            if dist < minDist then
+                minDist = dist
+                nearest = animalData
+            end
+        end
+    end
+    
+    return nearest
+end
+
+-- Should pre-fire check
+local function shouldPreFire(animalData)
+    local animalPos = getAnimalPosition(animalData.plot, animalData.slot)
+    if not animalPos then return false end
+    
+    local char = player.Character
+    if not char then return false end
+    local hrp = char:FindFirstChild('HumanoidRootPart')
+    if not hrp then return false end
+    
+    local currentDistance = (hrp.Position - animalPos).Magnitude
+    
+    if currentDistance <= STEAL_RADIUS then
+        return true
+    end
+    
+    return false
+end
+
+-- Auto steal nearest loop
+local lockedTarget = nil
+local lockedPrompt = nil
+local stealRadiusCircle = nil
+
+-- Create radius circle
+local function createStealRadiusCircle()
+    if stealRadiusCircle then
+        pcall(function() stealRadiusCircle:Destroy() end)
+    end
+    
+    local char = player.Character
+    if not char then return end
+    local hrp = char:FindFirstChild('HumanoidRootPart')
+    if not hrp then return end
+    
+    local circle = Instance.new('Part')
+    circle.Name = 'StealRadiusCircle'
+    circle.Size = Vector3.new(STEAL_RADIUS * 2, 0.2, STEAL_RADIUS * 2)
+    circle.Anchored = true
+    circle.CanCollide = false
+    circle.Transparency = 0.8
+    circle.Color = Color3.fromRGB(255, 100, 100)
+    circle.Material = Enum.Material.Neon
+    circle.CFrame = CFrame.new(hrp.Position.X, hrp.Position.Y - 3, hrp.Position.Z)
+    circle.Parent = game:GetService("Workspace")
+    
+    local mesh = Instance.new('CylinderMesh', circle)
+    mesh.Scale = Vector3.new(1, 0.1, 1)
+    
+    stealRadiusCircle = circle
+    
+    RunService.Heartbeat:Connect(function()
+        if not autoStealNearestEnabled or not circle or not circle.Parent then return end
+        local c = player.Character
+        if c then
+            local root = c:FindFirstChild('HumanoidRootPart')
+            if root then
+                circle.CFrame = CFrame.new(root.Position.X, root.Position.Y - 3, root.Position.Z)
+                circle.Size = Vector3.new(STEAL_RADIUS * 2, 0.2, STEAL_RADIUS * 2)
+            end
         end
     end)
 end
 
--- Đợi hoàn thành
-repeat task.wait(0.1) until completed >= 100
+local function removeStealRadiusCircle()
+    if stealRadiusCircle then
+        pcall(function() stealRadiusCircle:Destroy() end)
+        stealRadiusCircle = nil
+    end
+end
 
-print("━━━━━━━━━━━━━━━━━━━━━━━━━━")
-print(string.format("✅ Done in %.2fs (%.1f req/s)", tick() - start, 100/(tick()-start)))
+local function formatNumber(num)
+    if num >= 1e12 then
+        return string.format("%.1fT", num / 1e12)
+    elseif num >= 1e9 then
+        return string.format("%.1fB", num / 1e9)
+    elseif num >= 1e6 then
+        return string.format("%.1fM", num / 1e6)
+    elseif num >= 1e3 then
+        return string.format("%.1fK", num / 1e3)
+    else
+        return tostring(math.floor(num))
+    end
+end
+
+local function autoStealNearestLoop()
+    if stealNearestConnection then stealNearestConnection:Disconnect() end
+    
+    stealNearestConnection = RunService.Heartbeat:Connect(function()
+        if not autoStealNearestEnabled then
+            lockedTarget = nil
+            lockedPrompt = nil
+            return
+        end
+        
+        -- Check locked target
+        if lockedTarget and lockedPrompt then
+            local data = STATE.InternalStealCache[lockedPrompt]
+            
+            -- Check if it's own base (unlock immediately)
+            if isMyBaseAnimal(lockedTarget.plot) then
+                print('[Steal Nearest]  Unlocked (own base)')
+                lockedTarget = nil
+                lockedPrompt = nil
+                return
+            end
+            
+            -- If not ready (stealing), keep lock
+            if data and not data.ready then
+                return
+            end
+            
+            -- Check if still in range
+            if shouldPreFire(lockedTarget) then
+                -- Still in range, try steal again if ready
+                if data and data.ready then
+                    local success = executeInternalStealAsync(lockedPrompt)
+                    if success then
+                        print('[Steal Nearest - Locked] ', lockedTarget.name, '($' .. formatNumber(lockedTarget.genValue) .. '/s)')
+                    end
+                end
+                return
+            else
+                -- Out of range, unlock
+                print('[Steal Nearest]  Unlocked (out of range)')
+                lockedTarget = nil
+                lockedPrompt = nil
+            end
+        end
+        
+        -- Find new target
+        local targetAnimal = getNearestAnimal()
+        
+        if not targetAnimal then return end
+        if not shouldPreFire(targetAnimal) then return end
+        
+        -- Check if it's own base
+        if isMyBaseAnimal(targetAnimal.plot) then
+            return
+        end
+        
+        -- Lock new target
+        local prompt = findProximityPromptForAnimal(targetAnimal.plot, targetAnimal.slot)
+        if prompt then
+            buildStealCallbacks(prompt)
+            
+            if STATE.InternalStealCache[prompt] then
+                lockedTarget = targetAnimal
+                lockedPrompt = prompt
+                
+                local success = executeInternalStealAsync(prompt)
+                if success then
+                    print('[Steal Nearest]  Locked:', targetAnimal.name, '($' .. formatNumber(targetAnimal.genValue) .. '/s)')
+                end
+            end
+        end
+    end)
+end
+
+-- ============================================
+-- TOGGLE FUNCTIONS
+-- ============================================
+
+-- Toggle Speed Boost
+local function toggleSpeed()
+    enabled = not enabled
+    
+    if enabled then
+        if speedConn then speedConn:Disconnect() end
+        speedConn = RunService.Heartbeat:Connect(updateSpeed)
+        print(" SPEED ON | Normal:" .. SPEED_NORMAL .. " Stealing:" .. SPEED_STEALING)
+    else
+        if speedConn then
+            speedConn:Disconnect()
+            speedConn = nil
+        end
+        print(" SPEED OFF")
+    end
+    
+    config.speedEnabled = enabled
+    saveConfig()
+end
+
+-- Toggle Auto Bat
+local function toggleAutoBat()
+    autoBatEnabled = not autoBatEnabled
+    
+    if autoBatEnabled then
+        if autoBatConn then task.cancel(autoBatConn) end
+        autoBatConn = task.spawn(autoBatLoop)
+        print(" AUTO BAT ON | Keybind: " .. config.autoBatKeybind)
+    else
+        if autoBatConn then
+            task.cancel(autoBatConn)
+            autoBatConn = nil
+        end
+        print(" AUTO BAT OFF")
+    end
+    
+    config.autoBatEnabled = autoBatEnabled
+    saveConfig()
+end
+
+-- Toggle Hitbox Expander
+local function toggleHitbox()
+    hitboxEnabled = not hitboxEnabled
+    
+    if hitboxEnabled then
+        if hitboxConn then hitboxConn:Disconnect() end
+        hitboxConn = RunService.RenderStepped:Connect(updateHitboxes)
+        print(" HITBOX EXPANDER ON | Size: " .. HITBOX_SIZE)
+    else
+        if hitboxConn then
+            hitboxConn:Disconnect()
+            hitboxConn = nil
+        end
+        resetHitboxes()
+        print(" HITBOX EXPANDER OFF")
+    end
+    
+    config.hitboxEnabled = hitboxEnabled
+    saveConfig()
+end
+
+local function toggleAntiRagdoll()
+    antiRagdollEnabled = not antiRagdollEnabled
+    
+    if antiRagdollEnabled then
+        enableAntiRagdoll()
+        print(" ANTI RAGDOLL ON")
+    else
+        disableAntiRagdoll()
+        print(" ANTI RAGDOLL OFF")
+    end
+    
+    config.antiRagdollEnabled = antiRagdollEnabled
+    saveConfig()
+end
+
+local function toggleAutoStealNearest()
+    autoStealNearestEnabled = not autoStealNearestEnabled
+    
+    if autoStealNearestEnabled then
+        autoStealNearestLoop()
+        createStealRadiusCircle()
+        print(" AUTO STEAL NEAREST ON | Radius: " .. STEAL_RADIUS .. " studs")
+    else
+        if stealNearestConnection then
+            stealNearestConnection:Disconnect()
+            stealNearestConnection = nil
+        end
+        removeStealRadiusCircle()
+        lockedTarget = nil
+        lockedPrompt = nil
+        print(" AUTO STEAL NEAREST OFF")
+    end
+    
+    config.autoStealNearestEnabled = autoStealNearestEnabled
+    saveConfig()
+end
+
+local function createJumpButton()
+    if jumpButtonGui then
+        pcall(function() jumpButtonGui:Destroy() end)
+    end
+    
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "InfiniteJumpGUI"
+    screenGui.ResetOnSpawn = false
+    screenGui.Parent = player.PlayerGui
+    
+    local jumpButton = Instance.new("TextButton")
+    jumpButton.Name = "JumpButton"
+    jumpButton.Size = UDim2.new(0, 100, 0, 100)
+    jumpButton.Position = UDim2.new(0.85, 0, 0.8, 0)
+    jumpButton.Text = "Jump"
+    jumpButton.BackgroundColor3 = Color3.fromRGB(0, 170, 255)
+    jumpButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    jumpButton.BackgroundTransparency = 0.3
+    jumpButton.Font = Enum.Font.GothamBold
+    jumpButton.TextScaled = true
+    jumpButton.ZIndex = 10
+    jumpButton.Parent = screenGui
+    
+    jumpButton.MouseButton1Click:Connect(function()
+        if jumpBoostEnabled and hrp then
+            hrp.Velocity = Vector3.new(hrp.Velocity.X, JUMP_POWER, hrp.Velocity.Z)
+        end
+    end)
+    
+    jumpButtonGui = screenGui
+end
+
+local function removeJumpButton()
+    if jumpButtonGui then
+        pcall(function() jumpButtonGui:Destroy() end)
+        jumpButtonGui = nil
+    end
+end
+
+local function toggleJumpBoost()
+    jumpBoostEnabled = not jumpBoostEnabled
+    
+    if jumpBoostEnabled then
+        -- Update hrp reference
+        if player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+            hrp = player.Character.HumanoidRootPart
+        end
+        
+        -- Start gravity control loop (velocity-based, bypass anti-cheat)
+        if speedConn then speedConn:Disconnect() end
+        speedConn = RunService.Heartbeat:Connect(function()
+            if not hrp or not hrp.Parent then return end
+            
+            local velocity = hrp.AssemblyLinearVelocity
+            
+            -- If falling (negative Y velocity), slow it down based on GRAVITY_POWER
+            if velocity.Y < 0 then
+                local slowFactor = GRAVITY_POWER / 100 -- 50 = 50% speed, 10 = 10% speed
+                hrp.AssemblyLinearVelocity = Vector3.new(
+                    velocity.X,
+                    velocity.Y * slowFactor,
+                    velocity.Z
+                )
+            end
+        end)
+        
+        -- Create mobile jump button
+        createJumpButton()
+        
+        print(" JUMP BOOST ON | Jump: " .. JUMP_POWER .. " | Gravity: " .. GRAVITY_POWER .. "%")
+    else
+        -- Stop gravity control
+        if speedConn then
+            speedConn:Disconnect()
+            speedConn = nil
+        end
+        
+        -- Remove jump button
+        removeJumpButton()
+        
+        print(" JUMP BOOST OFF")
+    end
+    
+    config.jumpBoostEnabled = jumpBoostEnabled
+    saveConfig()
+end
+
+-- CharacterAdded handler for jump boost
+player.CharacterAdded:Connect(function(char)
+    hrp = char:WaitForChild("HumanoidRootPart")
+    
+    if jumpBoostEnabled then
+        createJumpButton()
+    end
+end)
+
+-- Space key handler for PC
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.KeyCode == Enum.KeyCode.Space then
+        if jumpBoostEnabled and hrp then
+            hrp.Velocity = Vector3.new(hrp.Velocity.X, JUMP_POWER, hrp.Velocity.Z)
+        end
+    end
+end)
+
+-- ============================================
+-- GUI CREATION
+-- ============================================
+
+local function createGUI()
+    -- Clean up old GUI if exists
+    local oldGui = game:GetService("CoreGui"):FindFirstChild("DualSpeedGUI")
+    if not oldGui then
+        oldGui = player.PlayerGui:FindFirstChild("DualSpeedGUI")
+    end
+    if oldGui then
+        oldGui:Destroy()
+    end
+    
+    -- ScreenGui
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "DualSpeedGUI"
+    sg.ResetOnSpawn = false
+    
+    -- Try to parent to CoreGui, fallback to PlayerGui
+    local success = pcall(function()
+        sg.Parent = game:GetService("CoreGui")
+    end)
+    if not success then
+        sg.Parent = player:WaitForChild("PlayerGui")
+    end
+    
+    -- ============================================
+    -- STATUS DISPLAY - Top Center
+    -- ============================================
+    local statusFrame = Instance.new("Frame")
+    statusFrame.Size = UDim2.new(0, 220, 0, 110)
+    statusFrame.Position = UDim2.new(0.5, -110, 0, 10)
+    statusFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+    statusFrame.BorderSizePixel = 0
+    statusFrame.Parent = sg
+    
+    Instance.new("UICorner", statusFrame).CornerRadius = UDim.new(0, 10)
+    
+    local statusStroke = Instance.new("UIStroke")
+    statusStroke.Name = "StatusBorderStroke"
+    statusStroke.Thickness = 2
+    statusStroke.Color = Color3.fromRGB(255, 100, 100)
+    statusStroke.Parent = statusFrame
+    
+    -- Rainbow border animation
+    task.spawn(function()
+        local hue = 0.5
+        while task.wait(0.05) do
+            hue = (hue + 0.01) % 1
+            statusStroke.Color = Color3.fromHSV(hue, 1, 1)
+        end
+    end)
+    
+    -- Status Label (Big)
+    local status = Instance.new("TextLabel")
+    status.Name = "StatusLabel"
+    status.Size = UDim2.new(1, -10, 0, 28)
+    status.Position = UDim2.new(0, 5, 0, 5)
+    status.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    status.Text = "OFF"
+    status.TextColor3 = Color3.fromRGB(150, 150, 150)
+    status.TextSize = 16
+    status.Font = Enum.Font.GothamBold
+    status.Parent = statusFrame
+    
+    Instance.new("UICorner", status).CornerRadius = UDim.new(0, 6)
+    
+    -- Pet Label with Rainbow effect
+    local petLabel = Instance.new("TextLabel")
+    petLabel.Name = "PetLabel"
+    petLabel.Size = UDim2.new(1, -10, 0, 16)
+    petLabel.Position = UDim2.new(0, 5, 0, 36)
+    petLabel.BackgroundTransparency = 1
+    petLabel.Text = "discord.gg/Meowhubsab"
+    petLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    petLabel.TextSize = 9
+    petLabel.Font = Enum.Font.GothamBold
+    petLabel.Parent = statusFrame
+    
+    -- Rainbow animation for discord link
+    task.spawn(function()
+        local hue = 0
+        while task.wait(0.05) do
+            hue = (hue + 0.01) % 1
+            petLabel.TextColor3 = Color3.fromHSV(hue, 1, 1)
+        end
+    end)
+    
+    -- Range and % Controls (2 rows)
+    local controlY = 54
+    
+    -- Range Label + Input
+    local rangeLabel = Instance.new("TextLabel")
+    rangeLabel.Size = UDim2.new(0, 50, 0, 16)
+    rangeLabel.Position = UDim2.new(0, 5, 0, controlY)
+    rangeLabel.BackgroundTransparency = 1
+    rangeLabel.Text = "Range:"
+    rangeLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    rangeLabel.TextSize = 9
+    rangeLabel.Font = Enum.Font.GothamBold
+    rangeLabel.TextXAlignment = Enum.TextXAlignment.Left
+    rangeLabel.Parent = statusFrame
+    
+    local rangeInput = Instance.new("TextBox")
+    rangeInput.Name = "RangeInput"
+    rangeInput.Size = UDim2.new(0, 50, 0, 16)
+    rangeInput.Position = UDim2.new(0, 58, 0, controlY)
+    rangeInput.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    rangeInput.Text = tostring(STEAL_RADIUS)
+    rangeInput.TextColor3 = Color3.new(1, 1, 1)
+    rangeInput.TextSize = 9
+    rangeInput.Font = Enum.Font.GothamBold
+    rangeInput.ClearTextOnFocus = false
+    rangeInput.Parent = statusFrame
+    
+    Instance.new("UICorner", rangeInput).CornerRadius = UDim.new(0, 4)
+    
+    rangeInput:GetPropertyChangedSignal("Text"):Connect(function()
+        local value = tonumber(rangeInput.Text)
+        if value and value > 0 and value <= 100 then
+            STEAL_RADIUS = value
+            config.stealRadius = value
+            saveConfig()
+        end
+    end)
+    
+    -- % Label (Readonly - hiển thị progress của prompt)
+    local percentLabel = Instance.new("TextLabel")
+    percentLabel.Size = UDim2.new(0, 30, 0, 16)
+    percentLabel.Position = UDim2.new(0, 115, 0, controlY)
+    percentLabel.BackgroundTransparency = 1
+    percentLabel.Text = "%:"
+    percentLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    percentLabel.TextSize = 9
+    percentLabel.Font = Enum.Font.GothamBold
+    percentLabel.TextXAlignment = Enum.TextXAlignment.Left
+    percentLabel.Parent = statusFrame
+    
+    local percentDisplay = Instance.new("TextLabel")
+    percentDisplay.Name = "PercentDisplay"
+    percentDisplay.Size = UDim2.new(0, 50, 0, 16)
+    percentDisplay.Position = UDim2.new(0, 148, 0, controlY)
+    percentDisplay.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    percentDisplay.Text = "0"
+    percentDisplay.TextColor3 = Color3.fromRGB(100, 255, 100)
+    percentDisplay.TextSize = 9
+    percentDisplay.Font = Enum.Font.GothamBold
+    percentDisplay.Parent = statusFrame
+    
+    Instance.new("UICorner", percentDisplay).CornerRadius = UDim.new(0, 4)
+    
+    -- FPS and Ping Display (moved down)
+    local statsLabel = Instance.new("TextLabel")
+    statsLabel.Name = "StatsLabel"
+    statsLabel.Size = UDim2.new(1, -10, 0, 16)
+    statsLabel.Position = UDim2.new(0, 5, 0, 75)
+    statsLabel.BackgroundTransparency = 1
+    statsLabel.Text = "FPS: 60 | Ping: 0ms"
+    statsLabel.TextColor3 = Color3.fromRGB(100, 255, 100)
+    statsLabel.TextSize = 9
+    statsLabel.Font = Enum.Font.GothamBold
+    statsLabel.Parent = statusFrame
+    
+    -- Steal Info Display
+    local stealInfo = Instance.new("TextLabel")
+    stealInfo.Name = "StealInfoLabel"
+    stealInfo.Size = UDim2.new(1, -10, 0, 14)
+    stealInfo.Position = UDim2.new(0, 5, 0, 92)
+    stealInfo.BackgroundTransparency = 1
+    stealInfo.Text = "Steal: Idle"
+    stealInfo.TextColor3 = Color3.fromRGB(150, 150, 150)
+    stealInfo.TextSize = 8
+    stealInfo.Font = Enum.Font.Gotham
+    stealInfo.Parent = statusFrame
+    
+    -- Update FPS and Ping using correct Stats method
+    local lastUpdate = tick()
+    local frameCount = 0
+    
+    task.spawn(function()
+        RunService.Heartbeat:Connect(function()
+            frameCount = frameCount + 1
+            local now = tick()
+            
+            if now - lastUpdate >= 1 then
+                local fps = frameCount
+                local ping = Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+                
+                statsLabel.Text = string.format("FPS: %d | Ping: %dms", fps, math.floor(ping))
+                
+                -- Color based on FPS
+                if fps >= 50 then
+                    statsLabel.TextColor3 = Color3.fromRGB(100, 255, 100)
+                elseif fps >= 30 then
+                    statsLabel.TextColor3 = Color3.fromRGB(255, 200, 100)
+                else
+                    statsLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+                end
+                
+                frameCount = 0
+                lastUpdate = now
+            end
+        end)
+    end)
+    
+    -- ============================================
+    -- MAIN GUI - Right Side
+    -- ============================================
+    
+    -- Main Frame - Vertical layout with 3 buttons horizontal
+    local frame = Instance.new("Frame")
+    frame.Name = "MainFrame"
+    frame.Size = UDim2.new(0, 200, 0, 274)
+    frame.Position = UDim2.new(1, -210, 0, 100)
+    frame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+    frame.BorderSizePixel = 0
+    frame.Parent = sg
+    
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
+    
+    local frameStroke = Instance.new("UIStroke")
+    frameStroke.Name = "BorderStroke"
+    frameStroke.Thickness = 2
+    frameStroke.Color = Color3.fromRGB(255, 100, 100)
+    frameStroke.Parent = frame
+    
+    -- Rainbow border animation (Cyan -> Red cycle)
+    task.spawn(function()
+        local hue = 0.5 -- Start at cyan
+        while task.wait(0.05) do
+            hue = (hue + 0.01) % 1
+            frameStroke.Color = Color3.fromHSV(hue, 1, 1)
+        end
+    end)
+    
+    -- Title with Rainbow effect
+    local title = Instance.new("TextLabel")
+    title.Name = "Title"
+    title.Size = UDim2.new(1, 0, 0, 22)
+    title.BackgroundColor3 = Color3.fromRGB(0, 150, 200)
+    title.Text = "MEOWPVP"
+    title.TextColor3 = Color3.new(1, 1, 1)
+    title.TextSize = 12
+    title.Font = Enum.Font.GothamBold
+    title.Parent = frame
+    
+    Instance.new("UICorner", title).CornerRadius = UDim.new(0, 8)
+    
+    -- Rainbow animation for title
+    task.spawn(function()
+        local hue = 0
+        while task.wait(0.05) do
+            hue = (hue + 0.01) % 1
+            title.TextColor3 = Color3.fromHSV(hue, 1, 1)
+        end
+    end)
+    
+    -- Normal Speed
+    local normalLabel = Instance.new("TextLabel")
+    normalLabel.Size = UDim2.new(0, 65, 0, 24)
+    normalLabel.Position = UDim2.new(0, 8, 0, 28)
+    normalLabel.BackgroundTransparency = 1
+    normalLabel.Text = "Normal:"
+    normalLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    normalLabel.TextSize = 11
+    normalLabel.Font = Enum.Font.GothamBold
+    normalLabel.TextXAlignment = Enum.TextXAlignment.Left
+    normalLabel.TextStrokeTransparency = 0.5
+    normalLabel.Parent = frame
+    
+    local normalInput = Instance.new("TextBox")
+    normalInput.Size = UDim2.new(0, 117, 0, 24)
+    normalInput.Position = UDim2.new(0, 75, 0, 28)
+    normalInput.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    normalInput.Text = tostring(SPEED_NORMAL)
+    normalInput.TextColor3 = Color3.new(1, 1, 1)
+    normalInput.TextSize = 11
+    normalInput.Font = Enum.Font.GothamBold
+    normalInput.TextStrokeTransparency = 0.7
+    normalInput.ClearTextOnFocus = false
+    normalInput.Parent = frame
+    
+    Instance.new("UICorner", normalInput).CornerRadius = UDim.new(0, 5)
+    
+    normalInput:GetPropertyChangedSignal("Text"):Connect(function()
+        local value = tonumber(normalInput.Text)
+        if value and value > 0 and value <= 500 then
+            SPEED_NORMAL = value
+            config.speedNormal = value
+            task.spawn(saveConfig)
+        end
+    end)
+    
+    -- Stealing Speed
+    local stealingLabel = Instance.new("TextLabel")
+    stealingLabel.Size = UDim2.new(0, 65, 0, 24)
+    stealingLabel.Position = UDim2.new(0, 8, 0, 57)
+    stealingLabel.BackgroundTransparency = 1
+    stealingLabel.Text = "Stealing:"
+    stealingLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    stealingLabel.TextSize = 11
+    stealingLabel.Font = Enum.Font.GothamBold
+    stealingLabel.TextXAlignment = Enum.TextXAlignment.Left
+    stealingLabel.TextStrokeTransparency = 0.5
+    stealingLabel.Parent = frame
+    
+    local stealingInput = Instance.new("TextBox")
+    stealingInput.Size = UDim2.new(0, 117, 0, 24)
+    stealingInput.Position = UDim2.new(0, 75, 0, 57)
+    stealingInput.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    stealingInput.Text = tostring(SPEED_STEALING)
+    stealingInput.TextColor3 = Color3.new(1, 1, 1)
+    stealingInput.TextSize = 11
+    stealingInput.Font = Enum.Font.GothamBold
+    stealingInput.TextStrokeTransparency = 0.7
+    stealingInput.ClearTextOnFocus = false
+    stealingInput.Parent = frame
+    
+    Instance.new("UICorner", stealingInput).CornerRadius = UDim.new(0, 5)
+    
+    stealingInput:GetPropertyChangedSignal("Text"):Connect(function()
+        local value = tonumber(stealingInput.Text)
+        if value and value > 0 and value <= 500 then
+            SPEED_STEALING = value
+            config.speedStealing = value
+            task.spawn(saveConfig)
+        end
+    end)
+    
+    -- Bat Key
+    local keybindLabel = Instance.new("TextLabel")
+    keybindLabel.Size = UDim2.new(0, 65, 0, 24)
+    keybindLabel.Position = UDim2.new(0, 8, 0, 86)
+    keybindLabel.BackgroundTransparency = 1
+    keybindLabel.Text = "Bat Key:"
+    keybindLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    keybindLabel.TextSize = 11
+    keybindLabel.Font = Enum.Font.GothamBold
+    keybindLabel.TextXAlignment = Enum.TextXAlignment.Left
+    keybindLabel.TextStrokeTransparency = 0.5
+    keybindLabel.Parent = frame
+    
+    local keybindInput = Instance.new("TextBox")
+    keybindInput.Size = UDim2.new(0, 117, 0, 24)
+    keybindInput.Position = UDim2.new(0, 75, 0, 86)
+    keybindInput.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    keybindInput.Text = config.autoBatKeybind
+    keybindInput.TextColor3 = Color3.new(1, 1, 1)
+    keybindInput.TextSize = 11
+    keybindInput.Font = Enum.Font.GothamBold
+    keybindInput.TextStrokeTransparency = 0.7
+    keybindInput.ClearTextOnFocus = false
+    keybindInput.Parent = frame
+    
+    Instance.new("UICorner", keybindInput).CornerRadius = UDim.new(0, 5)
+    
+    keybindInput:GetPropertyChangedSignal("Text"):Connect(function()
+        local key = keybindInput.Text:upper()
+        if #key == 1 and key:match("%a") then
+            config.autoBatKeybind = key
+            task.spawn(saveConfig)
+        end
+    end)
+    
+    -- Jump Label
+    local jumpLabel = Instance.new("TextLabel")
+    jumpLabel.Size = UDim2.new(0, 70, 0, 24)
+    jumpLabel.Position = UDim2.new(0, 8, 0, 113)
+    jumpLabel.BackgroundTransparency = 1
+    jumpLabel.Text = "Jump:"
+    jumpLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    jumpLabel.TextSize = 11
+    jumpLabel.Font = Enum.Font.GothamBold
+    jumpLabel.TextXAlignment = Enum.TextXAlignment.Left
+    jumpLabel.TextStrokeTransparency = 0.5
+    jumpLabel.Parent = frame
+    
+    local jumpInput = Instance.new("TextBox")
+    jumpInput.Name = "JumpInput"
+    jumpInput.Size = UDim2.new(0, 117, 0, 24)
+    jumpInput.Position = UDim2.new(0, 75, 0, 113)
+    jumpInput.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    jumpInput.Text = tostring(JUMP_POWER)
+    jumpInput.TextColor3 = Color3.new(1, 1, 1)
+    jumpInput.TextSize = 11
+    jumpInput.Font = Enum.Font.GothamBold
+    jumpInput.TextStrokeTransparency = 0.7
+    jumpInput.ClearTextOnFocus = false
+    jumpInput.Parent = frame
+    
+    Instance.new("UICorner", jumpInput).CornerRadius = UDim.new(0, 5)
+    
+    jumpInput:GetPropertyChangedSignal("Text"):Connect(function()
+        local value = tonumber(jumpInput.Text)
+        if value and value > 0 and value <= 500 then
+            JUMP_POWER = value
+            config.jumpPower = value
+            task.spawn(saveConfig)
+        end
+    end)
+    
+    -- Gravity Label
+    local gravityLabel = Instance.new("TextLabel")
+    gravityLabel.Size = UDim2.new(0, 70, 0, 24)
+    gravityLabel.Position = UDim2.new(0, 8, 0, 140)
+    gravityLabel.BackgroundTransparency = 1
+    gravityLabel.Text = "Gravity:"
+    gravityLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    gravityLabel.TextSize = 11
+    gravityLabel.Font = Enum.Font.GothamBold
+    gravityLabel.TextXAlignment = Enum.TextXAlignment.Left
+    gravityLabel.TextStrokeTransparency = 0.5
+    gravityLabel.Parent = frame
+    
+    local gravityInput = Instance.new("TextBox")
+    gravityInput.Name = "GravityInput"
+    gravityInput.Size = UDim2.new(0, 117, 0, 24)
+    gravityInput.Position = UDim2.new(0, 75, 0, 140)
+    gravityInput.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    gravityInput.Text = tostring(GRAVITY_POWER)
+    gravityInput.TextColor3 = Color3.new(1, 1, 1)
+    gravityInput.TextSize = 11
+    gravityInput.Font = Enum.Font.GothamBold
+    gravityInput.TextStrokeTransparency = 0.7
+    gravityInput.ClearTextOnFocus = false
+    gravityInput.Parent = frame
+    
+    Instance.new("UICorner", gravityInput).CornerRadius = UDim.new(0, 5)
+    
+    gravityInput:GetPropertyChangedSignal("Text"):Connect(function()
+        local value = tonumber(gravityInput.Text)
+        if value and value > 0 and value <= 100 then
+            GRAVITY_POWER = value
+            config.gravityPower = value
+            task.spawn(saveConfig)
+        end
+    end)
+        end
+    end)
+    
+    -- 3 Buttons Horizontal Row 1
+    local btnY = 189
+    local btnWidth = 60
+    local btnHeight = 24
+    
+    -- Speed Button
+    local speedBtn = Instance.new("TextButton")
+    speedBtn.Name = "SpeedButton"
+    speedBtn.Size = UDim2.new(0, btnWidth, 0, btnHeight)
+    speedBtn.Position = UDim2.new(0, 8, 0, btnY)
+    speedBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    speedBtn.Text = "Speed"
+    speedBtn.TextColor3 = Color3.new(1, 1, 1)
+    speedBtn.TextSize = 10
+    speedBtn.Font = Enum.Font.GothamBold
+    speedBtn.TextStrokeTransparency = 0.7
+    speedBtn.Parent = frame
+    
+    Instance.new("UICorner", speedBtn).CornerRadius = UDim.new(0, 5)
+    
+    speedBtn.MouseButton1Click:Connect(function()
+        toggleSpeed()
+        if enabled then
+            speedBtn.BackgroundColor3 = Color3.fromRGB(255, 100, 100)
+            speedBtn.TextColor3 = Color3.fromRGB(0, 0, 0)
+        else
+            speedBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+            speedBtn.TextColor3 = Color3.new(1, 1, 1)
+        end
+    end)
+    
+    -- Auto Bat Button
+    local batBtn = Instance.new("TextButton")
+    batBtn.Name = "AutoBatButton"
+    batBtn.Size = UDim2.new(0, btnWidth, 0, btnHeight)
+    batBtn.Position = UDim2.new(0, 8 + btnWidth + 2, 0, btnY)
+    batBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    batBtn.Text = "Bat"
+    batBtn.TextColor3 = Color3.new(1, 1, 1)
+    batBtn.TextSize = 10
+    batBtn.Font = Enum.Font.GothamBold
+    batBtn.TextStrokeTransparency = 0.7
+    batBtn.Parent = frame
+    
+    Instance.new("UICorner", batBtn).CornerRadius = UDim.new(0, 5)
+    
+    local function updateBatButton()
+        if autoBatEnabled then
+            batBtn.BackgroundColor3 = Color3.fromRGB(255, 100, 100)
+            batBtn.TextColor3 = Color3.fromRGB(0, 0, 0)
+        else
+            batBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+            batBtn.TextColor3 = Color3.new(1, 1, 1)
+        end
+    end
+    
+    batBtn.MouseButton1Click:Connect(function()
+        toggleAutoBat()
+        updateBatButton()
+    end)
+    
+    -- Hitbox Button
+    local hitboxBtn = Instance.new("TextButton")
+    hitboxBtn.Name = "HitboxButton"
+    hitboxBtn.Size = UDim2.new(0, btnWidth, 0, btnHeight)
+    hitboxBtn.Position = UDim2.new(0, 8 + (btnWidth + 2) * 2, 0, btnY)
+    hitboxBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    hitboxBtn.Text = "Hitbox"
+    hitboxBtn.TextColor3 = Color3.new(1, 1, 1)
+    hitboxBtn.TextSize = 10
+    hitboxBtn.Font = Enum.Font.GothamBold
+    hitboxBtn.TextStrokeTransparency = 0.7
+    hitboxBtn.Parent = frame
+    
+    Instance.new("UICorner", hitboxBtn).CornerRadius = UDim.new(0, 5)
+    
+    hitboxBtn.MouseButton1Click:Connect(function()
+        toggleHitbox()
+        if hitboxEnabled then
+            hitboxBtn.BackgroundColor3 = Color3.fromRGB(255, 100, 100)
+            hitboxBtn.TextColor3 = Color3.fromRGB(0, 0, 0)
+        else
+            hitboxBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+            hitboxBtn.TextColor3 = Color3.new(1, 1, 1)
+        end
+    end)
+    
+    -- Row 2: Anti Ragdoll and Auto Steal Nearest buttons
+    local btnY2 = 216
+    
+    -- Anti Ragdoll Button
+    local antiRagdollBtn = Instance.new("TextButton")
+    antiRagdollBtn.Name = "AntiRagdollButton"
+    antiRagdollBtn.Size = UDim2.new(0, 93, 0, btnHeight)
+    antiRagdollBtn.Position = UDim2.new(0, 8, 0, btnY2)
+    antiRagdollBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    antiRagdollBtn.Text = "AntiRagdoll"
+    antiRagdollBtn.TextColor3 = Color3.new(1, 1, 1)
+    antiRagdollBtn.TextSize = 9
+    antiRagdollBtn.Font = Enum.Font.GothamBold
+    antiRagdollBtn.TextStrokeTransparency = 0.7
+    antiRagdollBtn.Parent = frame
+    
+    Instance.new("UICorner", antiRagdollBtn).CornerRadius = UDim.new(0, 5)
+    
+    antiRagdollBtn.MouseButton1Click:Connect(function()
+        toggleAntiRagdoll()
+        if antiRagdollEnabled then
+            antiRagdollBtn.BackgroundColor3 = Color3.fromRGB(255, 100, 100)
+            antiRagdollBtn.TextColor3 = Color3.fromRGB(0, 0, 0)
+        else
+            antiRagdollBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+            antiRagdollBtn.TextColor3 = Color3.new(1, 1, 1)
+        end
+    end)
+    
+    -- Auto Steal Nearest Button
+    local stealNearestBtn = Instance.new("TextButton")
+    stealNearestBtn.Name = "AutoStealNearestButton"
+    stealNearestBtn.Size = UDim2.new(0, 91, 0, btnHeight)
+    stealNearestBtn.Position = UDim2.new(0, 103, 0, btnY2)
+    stealNearestBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    stealNearestBtn.Text = "StealNearest"
+    stealNearestBtn.TextColor3 = Color3.new(1, 1, 1)
+    stealNearestBtn.TextSize = 9
+    stealNearestBtn.Font = Enum.Font.GothamBold
+    stealNearestBtn.TextStrokeTransparency = 0.7
+    stealNearestBtn.Parent = frame
+    
+    Instance.new("UICorner", stealNearestBtn).CornerRadius = UDim.new(0, 5)
+    
+    stealNearestBtn.MouseButton1Click:Connect(function()
+        toggleAutoStealNearest()
+        if autoStealNearestEnabled then
+            stealNearestBtn.BackgroundColor3 = Color3.fromRGB(255, 100, 100)
+            stealNearestBtn.TextColor3 = Color3.fromRGB(0, 0, 0)
+        else
+            stealNearestBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+            stealNearestBtn.TextColor3 = Color3.new(1, 1, 1)
+        end
+    end)
+    
+    -- Row 3: Jump Boost button
+    local btnY3 = 243
+    
+    -- Jump Boost Button
+    local jumpBoostBtn = Instance.new("TextButton")
+    jumpBoostBtn.Name = "JumpBoostButton"
+    jumpBoostBtn.Size = UDim2.new(0, 186, 0, btnHeight)
+    jumpBoostBtn.Position = UDim2.new(0, 8, 0, btnY3)
+    jumpBoostBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    jumpBoostBtn.Text = "JumpBoost"
+    jumpBoostBtn.TextColor3 = Color3.new(1, 1, 1)
+    jumpBoostBtn.TextSize = 9
+    jumpBoostBtn.Font = Enum.Font.GothamBold
+    jumpBoostBtn.TextStrokeTransparency = 0.7
+    jumpBoostBtn.Parent = frame
+    
+    Instance.new("UICorner", jumpBoostBtn).CornerRadius = UDim.new(0, 5)
+    
+    jumpBoostBtn.MouseButton1Click:Connect(function()
+        toggleJumpBoost()
+        if jumpBoostEnabled then
+            jumpBoostBtn.BackgroundColor3 = Color3.fromRGB(255, 100, 100)
+            jumpBoostBtn.TextColor3 = Color3.fromRGB(0, 0, 0)
+        else
+            jumpBoostBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+            jumpBoostBtn.TextColor3 = Color3.new(1, 1, 1)
+        end
+    end)
+    
+    -- Update status display loop
+    task.spawn(function()
+        while task.wait(0.2) do
+            local statusFrame = sg:FindFirstChild("Frame")
+            if not statusFrame then continue end
+            
+            local statusLabel = statusFrame:FindFirstChild("StatusLabel")
+            local petLabelObj = statusFrame:FindFirstChild("PetLabel")
+            
+            if statusLabel and petLabelObj then
+                if enabled then
+                    local stealing = isStealing()
+                    local pet = getStealingPet()
+                    
+                    if stealing then
+                        statusLabel.Text = " STEALING"
+                        statusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+                        statusLabel.BackgroundColor3 = Color3.fromRGB(50, 10, 10)
+                        
+                        if pet then
+                            local shortName = tostring(pet):sub(1, 15)
+                            petLabelObj.Text = "Pet: " .. shortName
+                            petLabelObj.TextColor3 = Color3.fromRGB(255, 200, 100)
+                        else
+                            petLabelObj.Text = "Pet: Unknown"
+                            petLabelObj.TextColor3 = Color3.fromRGB(255, 200, 100)
+                        end
+                    else
+                        statusLabel.Text = " NORMAL"
+                        statusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+                        statusLabel.BackgroundColor3 = Color3.fromRGB(50, 10, 10)
+                        petLabelObj.Text = "discord.gg/Meowhubsab"
+                        petLabelObj.TextColor3 = Color3.fromRGB(150, 150, 150)
+                    end
+                else
+                    statusLabel.Text = "OFF"
+                    statusLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+                    statusLabel.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+                    petLabelObj.Text = "discord.gg/Meowhubsab"
+                    petLabelObj.TextColor3 = Color3.fromRGB(150, 150, 150)
+                end
+            end
+        end
+    end)
+    
+    -- Make frame draggable
+    local dragging = false
+    local dragStart = nil
+    local startPos = nil
+    
+    frame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+            dragStart = input.Position
+            startPos = frame.Position
+        end
+    end)
+    
+    game:GetService("UserInputService").InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement and dragging then
+            local delta = input.Position - dragStart
+            frame.Position = UDim2.new(
+                startPos.X.Scale,
+                startPos.X.Offset + delta.X,
+                startPos.Y.Scale,
+                startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+    
+    game:GetService("UserInputService").InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = false
+        end
+    end)
+end
+
+-- ============================================
+-- MONITORING & DEBUG
+-- ============================================
+
+-- Monitor attribute changes for debug
+player.AttributeChanged:Connect(function(attrName)
+    if attrName == "Stealing" then
+        local value = player:GetAttribute("Stealing")
+        if value then
+            print(" Started stealing - Speed: " .. SPEED_STEALING)
+        else
+            print(" Stopped stealing - Speed: " .. SPEED_NORMAL)
+        end
+    elseif attrName == "StealingIndex" then
+        local pet = player:GetAttribute("StealingIndex")
+        print("🐾 Stealing pet: " .. tostring(pet))
+    end
+end)
+
+-- ============================================
+-- CHARACTER RESPAWN HANDLER
+-- ============================================
+
+player.CharacterAdded:Connect(function()
+    task.wait(1)
+    
+    -- Reconnect speed if enabled
+    if enabled then
+        if speedConn then speedConn:Disconnect() end
+        task.wait(0.5)
+        speedConn = RunService.Heartbeat:Connect(updateSpeed)
+        print(" Speed reconnected after respawn")
+    end
+    
+    -- Reconnect auto steal if enabled
+    if autoStealEnabled then
+        if autoStealConn then task.cancel(autoStealConn) end
+        task.wait(0.5)
+        autoStealConn = task.spawn(autoStealLoop)
+        print(" Auto steal reconnected after respawn")
+    end
+    
+    -- Anti knockback handles respawn internally via CharacterAdded
+    -- No need to manually reconnect
+end)
+
+-- ============================================
+-- INITIALIZE
+-- ============================================
+
+-- Load config first
+loadConfig()
+
+-- Create GUI
+createGUI()
+
+-- Update range input with loaded config
+task.spawn(function()
+    task.wait(0.1)
+    local gui = game:GetService("CoreGui"):FindFirstChild("DualSpeedGUI") or player.PlayerGui:FindFirstChild("DualSpeedGUI")
+    if gui then
+        local statusFrame = gui:FindFirstChild("Frame")
+        if statusFrame then
+            local rangeInput = statusFrame:FindFirstChild("RangeInput")
+            if rangeInput then
+                rangeInput.Text = tostring(STEAL_RADIUS)
+            end
+        end
+    end
+end)
+
+-- Apply loaded config states
+if config.speedEnabled then
+    task.spawn(function()
+        task.wait(0.5)
+        toggleSpeed()
+        -- Update button color
+        local gui = game:GetService("CoreGui"):FindFirstChild("DualSpeedGUI") or player.PlayerGui:FindFirstChild("DualSpeedGUI")
+        if gui then
+            local frame = gui:FindFirstChild("MainFrame")
+            if frame then
+                local btn = frame:FindFirstChild("SpeedButton")
+                if btn then
+                    btn.BackgroundColor3 = Color3.fromRGB(255, 100, 100)
+                    btn.TextColor3 = Color3.fromRGB(0, 0, 0)
+                end
+            end
+        end
+    end)
+end
+
+if config.autoBatEnabled then
+    task.spawn(function()
+        task.wait(0.5)
+        toggleAutoBat()
+        -- Update button color
+        local gui = game:GetService("CoreGui"):FindFirstChild("DualSpeedGUI") or player.PlayerGui:FindFirstChild("DualSpeedGUI")
+        if gui then
+            local frame = gui:FindFirstChild("MainFrame")
+            if frame then
+                local btn = frame:FindFirstChild("AutoBatButton")
+                if btn then
+                    btn.BackgroundColor3 = Color3.fromRGB(255, 100, 100)
+                    btn.TextColor3 = Color3.fromRGB(0, 0, 0)
+                end
+            end
+        end
+    end)
+end
+
+if config.hitboxEnabled then
+    task.spawn(function()
+        task.wait(0.5)
+        toggleHitbox()
+        -- Update button color
+        local gui = game:GetService("CoreGui"):FindFirstChild("DualSpeedGUI") or player.PlayerGui:FindFirstChild("DualSpeedGUI")
+        if gui then
+            local frame = gui:FindFirstChild("MainFrame")
+            if frame then
+                local btn = frame:FindFirstChild("HitboxButton")
+                if btn then
+                    btn.BackgroundColor3 = Color3.fromRGB(255, 100, 100)
+                    btn.TextColor3 = Color3.fromRGB(0, 0, 0)
+                end
+            end
+        end
+    end)
+end
+
+if config.antiRagdollEnabled then
+    task.spawn(function()
+        task.wait(0.5)
+        toggleAntiRagdoll()
+        -- Update button color
+        local gui = game:GetService("CoreGui"):FindFirstChild("DualSpeedGUI") or player.PlayerGui:FindFirstChild("DualSpeedGUI")
+        if gui then
+            local frame = gui:FindFirstChild("MainFrame")
+            if frame then
+                local btn = frame:FindFirstChild("AntiRagdollButton")
+                if btn then
+                    btn.BackgroundColor3 = Color3.fromRGB(255, 100, 100)
+                    btn.TextColor3 = Color3.fromRGB(0, 0, 0)
+                end
+            end
+        end
+    end)
+end
+
+if config.autoStealNearestEnabled then
+    task.spawn(function()
+        task.wait(0.5)
+        toggleAutoStealNearest()
+        -- Update button color
+        local gui = game:GetService("CoreGui"):FindFirstChild("DualSpeedGUI") or player.PlayerGui:FindFirstChild("DualSpeedGUI")
+        if gui then
+            local frame = gui:FindFirstChild("MainFrame")
+            if frame then
+                local btn = frame:FindFirstChild("AutoStealNearestButton")
+                if btn then
+                    btn.BackgroundColor3 = Color3.fromRGB(255, 100, 100)
+                    btn.TextColor3 = Color3.fromRGB(0, 0, 0)
+                end
+            end
+        end
+    end)
+end
+
+if config.jumpBoostEnabled then
+    task.spawn(function()
+        task.wait(0.5)
+        toggleJumpBoost()
+        -- Update button color
+        local gui = game:GetService("CoreGui"):FindFirstChild("DualSpeedGUI") or player.PlayerGui:FindFirstChild("DualSpeedGUI")
+        if gui then
+            local frame = gui:FindFirstChild("MainFrame")
+            if frame then
+                local btn = frame:FindFirstChild("JumpBoostButton")
+                if btn then
+                    btn.BackgroundColor3 = Color3.fromRGB(255, 100, 100)
+                    btn.TextColor3 = Color3.fromRGB(0, 0, 0)
+                end
+            end
+        end
+    end)
+end
+
+-- Keybind listener
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    
+    if input.KeyCode == Enum.KeyCode[config.autoBatKeybind] then
+        toggleAutoBat()
+        
+        -- Update GUI button
+        task.spawn(function()
+            local gui = game:GetService("CoreGui"):FindFirstChild("DualSpeedGUI")
+            if not gui then
+                gui = player.PlayerGui:FindFirstChild("DualSpeedGUI")
+            end
+            
+            if gui then
+                local frame = gui:FindFirstChild("MainFrame")
+                if frame then
+                    local batBtn = frame:FindFirstChild("AutoBatButton")
+                    if batBtn then
+                        if autoBatEnabled then
+                            batBtn.BackgroundColor3 = Color3.fromRGB(255, 100, 100)
+                            batBtn.TextColor3 = Color3.fromRGB(0, 0, 0)
+                        else
+                            batBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+                            batBtn.TextColor3 = Color3.new(1, 1, 1)
+                        end
+                    end
+                end
+            end
+        end)
+    end
+end)
+
+print("===========================================")
+print(" MeowPVP - Dual Speed + Auto Bat + Hitbox!")
+print("===========================================")
+print(" Normal Speed: " .. SPEED_NORMAL)
+print(" Stealing Speed: " .. SPEED_STEALING)
+print(" Auto Bat Keybind: " .. config.autoBatKeybind)
+print(" Hitbox Size: " .. HITBOX_SIZE .. " studs")
+print(" Config: " .. CONFIG_FILE)
+print(" Discord: discord.gg/Meowhubsab")
+print("===========================================")
